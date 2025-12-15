@@ -10,17 +10,21 @@ import {
   Avatar,
   Stack,
   useTheme,
-  Fade
+  Fade,
+  Alert,
+  CircularProgress
 } from '@mui/material';
 import BreadCrumbNav from './breadcrumb';
 import PersonAddIcon from '@mui/icons-material/PersonAdd';
 import SendIcon from '@mui/icons-material/Send';
 
-const SERVER_URL = import.meta.env.VITE_SERVER_URL;
+const SERVER_URL=import.meta.env.VITE_SERVER_URL;
 
 function Register() {
-  const socket = io(SERVER_URL);
   const [formData, setFormData] = useState({ name: "", age: 0, foods: "" });
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+  const [success, setSuccess] = useState(false);
   const theme = useTheme();
 
   const handleFormChange = (e) => {
@@ -28,9 +32,38 @@ function Register() {
     setFormData(prev => ({ ...prev, [name]: value }));
   };
 
-  const handleFormSubmit = (e) => {
+  const handleFormSubmit = async (e) => {
     e.preventDefault();
-    socket.emit("formSubmit", formData);
+    setLoading(true);
+    setError(null);
+    setSuccess(false);
+
+    try {
+      const response = await fetch(`http://${SERVER_URL}/api/FormUpload`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(formData),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      console.log('Success:', data);
+      
+      setSuccess(true);
+      // Reset form after successful submission
+      setFormData({ name: "", age: 0, foods: "" });
+      
+    } catch (err) {
+      console.error('Error submitting form:', err);
+      setError(err.message || 'Failed to submit form');
+    } finally {
+      setLoading(false);
+    }
   };
 
   return (
@@ -88,6 +121,18 @@ function Register() {
             </Box>
           </Stack>
 
+          {/* Success/Error Messages */}
+          {success && (
+            <Alert severity="success" sx={{ mb: 2 }}>
+              Registered successfully!
+            </Alert>
+          )}
+          {error && (
+            <Alert severity="error" sx={{ mb: 2 }}>
+              {error}
+            </Alert>
+          )}
+
           <form onSubmit={handleFormSubmit}>
             <Stack spacing={3}>
               <TextField
@@ -98,6 +143,7 @@ function Register() {
                 onChange={handleFormChange}
                 placeholder="John Doe"
                 required
+                disabled={loading}
                 variant="outlined"
                 size="medium"
                 sx={{
@@ -117,6 +163,7 @@ function Register() {
                 placeholder="25"
                 inputProps={{ min: "0", max: "120" }}
                 required
+                disabled={loading}
                 variant="outlined"
                 size="medium"
                 sx={{
@@ -134,6 +181,7 @@ function Register() {
                 value={formData.foods}
                 onChange={handleFormChange}
                 required
+                disabled={loading}
                 variant="outlined"
                 size="medium"
                 sx={{
@@ -152,7 +200,8 @@ function Register() {
                 type="submit"
                 variant="contained"
                 size="large"
-                endIcon={<SendIcon />}
+                disabled={loading}
+                endIcon={loading ? <CircularProgress size={20} color="inherit" /> : <SendIcon />}
                 sx={{
                   py: 1.5,
                   borderRadius: 2,
@@ -168,7 +217,7 @@ function Register() {
                   transition: 'all 0.2s ease',
                 }}
               >
-                Submit
+                {loading ? 'Submitting...' : 'Submit'}
               </Button>
             </Stack>
           </form>

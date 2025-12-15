@@ -3,13 +3,12 @@ import { sqlconn } from '../connections/MySqlDB.js';
 import { Worker } from 'bullmq';
 import Redis from 'ioredis';
 
-// Redis client for simple pub/sub on completion
 const pub = new Redis({ host: process.env.REDISHOST, port: 6379 });
 
 const bulkWorker = new Worker('SagarBulkQueue', async job => {
   const { records, clientId, fileName } = job.data;
   
-  console.log(`\n🚀 BulkWorker processing ${records.length} records for client: ${clientId}`);
+  console.log(`\n🚀 Processing ${records.length} records for client: ${clientId}`);
   console.log(`📁 File: ${fileName}, Job ID: ${job.id}`);
   
   let successCount = 0;
@@ -17,101 +16,88 @@ const bulkWorker = new Worker('SagarBulkQueue', async job => {
   const errors = [];
   const totalRecords = records.length;
   
-  // ✅ SINGLE MongoDB connection for entire job
+  // ✅ OPTIMIZATION: Single MongoDB connection for entire job
   let mongoClient = null;
   
   try {
-    // ✅ Connect ONCE at the beginning
+    // Connect ONCE at the beginning
     mongoClient = await connectToDB();
     const db = mongoClient.db("test");
     const collection = db.collection("userschemas");
     
     console.log(`✅ MongoDB connected for job ${job.id}`);
     
-    // Use bulk inserts for maximum speed - NO progress updates
-    const BATCH_SIZE = 500; // Larger batch = faster
+    // ✅ FAST BATCH INSERT - Process in large chunks
+    const BATCH_SIZE = 1000; // Larger batches = faster
     
-    // Process ALL records without progress updates
-    for (let batchStart = 0; batchStart < totalRecords; batchStart += BATCH_SIZE) {
-      const batch = records.slice(batchStart, batchStart + BATCH_SIZE);
-      const batchNumber = Math.floor(batchStart / BATCH_SIZE) + 1;
+    for (let i = 0; i < totalRecords; i += BATCH_SIZE) {
+      const batch = records.slice(i, i + BATCH_SIZE);
+      const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+      const totalBatches = Math.ceil(totalRecords / BATCH_SIZE);
       
-      console.log(`📦 Processing batch ${batchNumber}/${Math.ceil(totalRecords / BATCH_SIZE)}`);
+      console.log(`📦 Batch ${batchNum}/${totalBatches} (${batch.length} records)`);
       
       try {
-        // MongoDB BULK insert
-        const insertResult = await collection.insertMany(batch, { ordered: false });
-        successCount += insertResult.insertedCount;
+        // ✅ MongoDB bulk insert
+        await collection.insertMany(batch, { ordered: false });
         
-        // MySQL BULK insert
-        const values = batch.map(record => [record.name, Number(record.age), record.foods]);
+        // ✅ MySQL bulk insert
+        const values = batch.map(r => [r.name, Number(r.age), r.foods]);
         const placeholders = batch.map(() => '(?, ?, ?)').join(', ');
-        const flattenedValues = values.flat();
         
         await sqlconn.execute(
           `INSERT INTO foodpreferences(name, age, foods) VALUES ${placeholders}`,
-          flattenedValues
+          values.flat()
         );
         
         successCount += batch.length;
         
       } catch (batchError) {
-        console.error(`❌ Batch ${batchNumber} failed:`, batchError.message);
-        failCount += batch.length;
+        console.error(`❌ Batch ${batchNum} error:`, batchError.message);
         
-        // Fallback: try individual inserts
-        for (let i = 0; i < batch.length; i++) {
+        // ✅ Fallback: Try individual inserts for failed batch
+        for (let j = 0; j < batch.length; j++) {
           try {
-            const record = batch[i];
-            
+            const record = batch[j];
             await collection.insertOne(record);
-            
             await sqlconn.execute(
               'INSERT INTO foodpreferences(name, age, foods) VALUES (?, ?, ?)',
               [record.name, Number(record.age), record.foods]
             );
-            
             successCount++;
-            failCount--;
-            
           } catch (recordError) {
-            errors.push({
-              row: batchStart + i + 1,
-              error: recordError.message
-            });
+            failCount++;
+            errors.push({ row: i + j + 1, error: recordError.message });
           }
         }
       }
     }
     
-    // Final result
+    // ✅ Final result
     const result = {
       jobId: job.id,
       clientId,
       fileName,
       totalRecords,
-      successCount: Math.floor(successCount / 2), // Divide by 2 because we counted twice
+      successCount,
       failCount,
-      errors: errors.slice(0, 10), // Limit error details
+      errors: errors.slice(0, 10),
       success: failCount === 0,
       timestamp: new Date().toISOString()
     };
     
-    console.log(`\n✅ Bulk job ${job.id} completed:`);
-    console.log(`   Success: ${result.successCount}, Failed: ${result.failCount}`);
-    console.log(`   Client: ${clientId}, File: ${fileName}`);
+    console.log(`\n✅ Job ${job.id} completed:`);
+    console.log(`   Success: ${successCount}, Failed: ${failCount}`);
     
-    // ✅ SINGLE PUBLISH on completion (not progress)
-    console.log(`📤 Publishing to Redis channel 'bulkUploadComplete'...`);
+    // ✅ Publish completion to Redis (Socket.IO will forward to client)
     await pub.publish('bulkUploadComplete', JSON.stringify(result));
-    console.log(`✅ Published to Redis`);
     
     // ✅ Trigger dashboard updates
     await pub.publish('mongoUpdates', JSON.stringify({
       success: true,
       trigger: 'bulk_upload',
       jobId: job.id,
-      recordsInserted: result.successCount,
+      recordsInserted: successCount,
       timestamp: new Date().toISOString()
     }));
     
@@ -119,16 +105,16 @@ const bulkWorker = new Worker('SagarBulkQueue', async job => {
       success: true,
       trigger: 'bulk_upload',
       jobId: job.id,
-      recordsInserted: result.successCount,
+      recordsInserted: successCount,
       timestamp: new Date().toISOString()
     }));
     
-    console.log(`✅ Dashboard updates triggered`);
+    console.log(`✅ Redis notifications sent`);
     
     return result;
     
   } catch (error) {
-    console.error(`\n💥 Bulk job ${job.id} failed:`, error);
+    console.error(`\n💥 Job ${job.id} failed:`, error);
     
     // Publish error
     const errorResult = {
@@ -141,36 +127,28 @@ const bulkWorker = new Worker('SagarBulkQueue', async job => {
     };
     
     await pub.publish('bulkUploadComplete', JSON.stringify(errorResult));
-    console.log(`📤 Published error to Redis`);
-    
     throw error;
     
   } finally {
     // ✅ ALWAYS close MongoDB connection
     if (mongoClient) {
-      try {
-        await mongoClient.close();
-        console.log(`✅ MongoDB connection closed for job ${job.id}`);
-      } catch (closeError) {
-        console.error('Error closing MongoDB connection:', closeError);
-      }
+      await mongoClient.close();
+      console.log(`✅ MongoDB connection closed for job ${job.id}`);
     }
   }
 }, {
   connection: { host: process.env.REDISHOST, port: 6379 },
-  concurrency: 2,
+  concurrency: 3, // Process 3 jobs simultaneously
   stalledInterval: 120000,
   lockDuration: 120000
 });
 
-// Worker events for logging
 bulkWorker.on('completed', (job, result) => {
-  console.log(`\n🎉 Bulk job ${job.id} completed successfully`);
-  console.log(`   Result:`, result);
+  console.log(`\n🎉 Job ${job.id} completed: ${result.successCount}/${result.totalRecords} records`);
 });
 
 bulkWorker.on('failed', (job, err) => {
-  console.error(`\n💥 Bulk job ${job.id} failed:`, err);
+  console.error(`\n💥 Job ${job.id} failed:`, err.message);
 });
 
-console.log('✅ Bulk upload worker started (No progress tracking - Fast mode)');
+console.log('✅ Bulk upload worker started (Optimized - Fast mode)');
